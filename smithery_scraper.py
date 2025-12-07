@@ -239,6 +239,67 @@ class SmitheryScraper:
             "description": description,
             "inputSchema": input_schema
         }
+
+    def parse_tools_from_text(self, body_text: str) -> List[Dict[str, Any]]:
+        """
+        Fallback parser when clickable tool elements are absent.
+        Heuristic: after the 'Tools' section header, treat alternating non-empty lines
+        as tool names and subsequent non-empty lines as descriptions until a section break.
+        """
+        tools = []
+        lines = [ln.strip() for ln in body_text.split("\n")]
+
+        try:
+            start_idx = lines.index("Tools")
+        except ValueError:
+            return tools
+
+        i = start_idx + 1
+        # Skip numeric lines like total count or pagination
+        while i < len(lines) and (lines[i].isdigit() or "/" in lines[i]):
+            i += 1
+
+        while i < len(lines):
+            line = lines[i].strip()
+            if not line:
+                i += 1
+                continue
+            if line in ["Connect", "Details", "Company", "Capabilities"]:
+                break
+            # Skip section labels that may precede tools list
+            if line in ["Resources", "Prompts"]:
+                i += 1
+                # Also skip any immediate numeric after heading
+                if i < len(lines) and lines[i].isdigit():
+                    i += 1
+                continue
+
+            name = line
+            i += 1
+            desc_lines = []
+            while i < len(lines):
+                desc_line = lines[i].strip()
+                if not desc_line:
+                    i += 1
+                    continue
+                if desc_line in ["Connect", "Details", "Resources", "Company", "Capabilities", "Prompts"]:
+                    break
+                if desc_line.isupper() and "_" in desc_line:
+                    break
+                # Heuristic: stop if looks like next name (short line, title case or contains parentheses)
+                if len(desc_line.split()) <= 6 and desc_line[0].isupper():
+                    break
+                desc_lines.append(desc_line)
+                i += 1
+            description = " ".join(desc_lines).strip()
+            tools.append(
+                {
+                    "name": name,
+                    "description": description,
+                    "inputSchema": {"type": "object", "properties": {}},
+                }
+            )
+        return tools
     
     def scrape_tools_with_params(self, page, server_url: str, max_tools: int = None) -> List[Dict[str, Any]]:
         """
@@ -258,8 +319,13 @@ class SmitheryScraper:
                 page.goto(tools_url, wait_until='networkidle', timeout=90000)  # 90 second timeout
                 page.wait_for_timeout(5000)  # Wait 5 seconds for dynamic content
             except Exception as e:
-                print(f"      [ERROR] Failed to load tools page {tool_page_num}: {e}")
-                break
+                print(f"      [WARN] networkidle load failed for tools page {tool_page_num}: {e}. Retrying with domcontentloaded...")
+                try:
+                    page.goto(tools_url, wait_until='domcontentloaded', timeout=120000)
+                    page.wait_for_timeout(7000)  # slightly longer wait after fallback
+                except Exception as e2:
+                    print(f"      [ERROR] Failed to load tools page {tool_page_num} even after fallback: {e2}")
+                    break
             
             # Check pagination
             body_text = page.locator('body').inner_text()
@@ -343,7 +409,12 @@ class SmitheryScraper:
                     continue
             
             if not tool_elements:
-                print(f"      No tools found on page {tool_page_num} - stopping")
+                print(f"      No clickable tools found on page {tool_page_num}, attempting text fallback")
+                # Fallback: parse tool names/descriptions from body text when click targets are absent
+                body_text = page.locator('body').inner_text()
+                fallback_tools = self.parse_tools_from_text(body_text)
+                if fallback_tools:
+                    tools.extend(fallback_tools)
                 break
             
             print(f"      Found {len(tool_elements)} clickable tools on this page")
@@ -665,12 +736,17 @@ class SmitheryScraper:
         tool_count_match = re.search(r'Tools\s*(\d+)', body_text)
         if tool_count_match:
             total_tools = int(tool_count_match.group(1))
-        
+
         # Scrape tools with parameters (all tools)
         tools = []
         if total_tools > 0:
             print(f"    Scraping ALL tools with parameters ({total_tools} total)...")
             tools = self.scrape_tools_with_params(page, url, max_tools=None)
+        else:
+            # Attempt scraping even when total_tools is unknown (count unavailable on page)
+            print("    Tool count not found; attempting to scrape tools anyway...")
+            tools = self.scrape_tools_with_params(page, url, max_tools=None)
+            total_tools = len(tools)
         
         # Build server data
         server_data = {
